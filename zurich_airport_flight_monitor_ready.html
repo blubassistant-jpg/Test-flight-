@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zürich Airport Flight Monitor</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#0e0e0e;color:#eee}
+body{display:flex;flex-direction:column;overflow:hidden}
+header{height:78px;display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:#181818;border-bottom:1px solid #333}
+h1{font-size:20px;margin:0}.sub{font-size:12px;color:#888}
+#clock{font:700 28px ui-monospace,SFMono-Regular,Menlo,monospace;text-align:right}
+#date{font-size:12px;color:#999;text-align:right}
+main{display:grid;grid-template-columns:1fr 1fr;flex:1;min-height:0}
+.panel{min-width:0;display:flex;flex-direction:column}
+.panel+ .panel{border-left:2px solid #333}
+.panel h2{margin:0;padding:12px 16px;background:#1b1b1b;font-size:18px}
+.board{overflow:auto;padding:8px}
+.row{display:grid;grid-template-columns:62px 90px 1fr 90px;gap:10px;align-items:center;padding:11px 10px;border-bottom:1px solid #292929}
+.row .time{font:600 18px ui-monospace,SFMono-Regular,Menlo,monospace}
+.row .flight{font-weight:700}.route{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta{font-size:11px;color:#888;margin-top:3px}
+.status{font-size:12px;text-align:right;color:#aaa}
+.empty{padding:30px;text-align:center;color:#777}
+footer{height:50px;display:flex;align-items:center;gap:8px;padding:7px 12px;background:#181818;border-top:1px solid #333}
+button{border:0;border-radius:8px;padding:8px 13px;cursor:pointer}
+#start{background:#eee;color:#111}#stop{background:#444;color:#fff}
+#status{font-size:12px;color:#999}
+#pop{display:none;position:fixed;inset:0;background:#000b;align-items:center;justify-content:center;padding:20px;z-index:20}
+#box{background:#1b1b1b;border:3px solid #ff8a00;border-radius:16px;max-width:680px;width:100%;padding:24px;box-shadow:0 20px 70px #000}
+#title{font-size:13px;color:#ffad45;font-weight:700;text-transform:uppercase;letter-spacing:.08em}
+.alert{padding:13px 0;border-bottom:1px solid #333;font-size:19px;line-height:1.45}
+.alert:last-child{border-bottom:0}
+.detail{display:block;font-size:13px;color:#aaa;margin-top:4px}
+#close{width:100%;background:#eee;color:#111;margin-top:18px}
+@media(max-width:760px){
+  main{grid-template-columns:1fr;grid-template-rows:1fr 1fr}
+  .panel+.panel{border-left:0;border-top:2px solid #333}
+  #clock{font-size:21px}
+}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>✈️ Zürich Airport</h1><div class="sub">Live FIDS data · browser only</div></div>
+  <div><div id="clock">--:--:--</div><div id="date">--</div></div>
+</header>
+
+<main>
+<section class="panel">
+  <h2>🛬 Arrivals</h2>
+  <div id="arrivals" class="board"><div class="empty">Loading arrivals…</div></div>
+</section>
+<section class="panel">
+  <h2>🛫 Departures</h2>
+  <div id="departures" class="board"><div class="empty">Loading departures…</div></div>
+</section>
+</main>
+
+<footer>
+  <button id="start">▶ Start alerts</button>
+  <button id="stop" disabled>■ Stop</button>
+  <button id="test">🔊 Test</button>
+  <span id="status">Clock running · alerts stopped</span>
+</footer>
+
+<div id="pop">
+  <div id="box">
+    <div id="title">Flight alert</div>
+    <div id="messages"></div>
+    <button id="close" type="button">Close</button>
+  </div>
+</div>
+
+<script>
+/*
+  Zürich Airport's FIDS endpoint. A public project documenting the airport
+  site identifies this endpoint as the JSON source behind the flight tables.
+  The JSON contains flight number, city, airline, scheduled/estimated time,
+  aircraft type/model and registration when available.
+*/
+const FIDS="https://dxp-fds.flughafen-zuerich.ch/flights";
+const FALLBACK="https://r.jina.ai/http://dxp-fds.flughafen-zuerich.ch/flights";
+
+let arrivals=[],departures=[],timer=null,seen=new Set(),started=false;
+
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const clean=s=>String(s??"").replace(/\s+/g," ").trim();
+
+function tick(){
+  const n=new Date();
+  $("clock").textContent=n.toLocaleTimeString("de-CH",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+  $("date").textContent=n.toLocaleDateString("de-CH",{weekday:"short",day:"2-digit",month:"2-digit",year:"numeric"});
+}
+tick();setInterval(tick,1000);
+
+function speak(messages){
+  if(!("speechSynthesis" in window))return;
+  speechSynthesis.cancel();
+  messages.forEach(text=>{
+    const u=new SpeechSynthesisUtterance(text);
+    u.lang="en-US";u.rate=.92;
+    speechSynthesis.speak(u);
+  });
+}
+
+function popup(items){
+  $("messages").innerHTML=items.map(x=>`
+    <div class="alert">
+      ${esc(x.message)}
+      <span class="detail">${esc(x.detail||"")}</span>
+    </div>`).join("");
+  $("pop").style.display="flex";
+  speak(items.map(x=>x.message));
+}
+function closePopup(){$("pop").style.display="none"}
+$("close").addEventListener("click",closePopup);
+$("pop").addEventListener("click",e=>{if(e.target===$("pop"))closePopup()});
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closePopup()});
+
+function rawTime(f,type){
+  return clean(type==="arrival" ? (f.ETA||f.STA) : (f.ETD||f.SDT));
+}
+function parseFlightTime(raw){
+  if(!raw)return null;
+  const s=String(raw).trim();
+  // Zürich FIDS commonly returns HH:mm without a date. Treat it as today.
+  let m=s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if(m){
+    const d=new Date();
+    d.setHours(+m[1],+m[2],+(m[3]||0),0);
+    return d;
+  }
+  const d=new Date(s);
+  return Number.isNaN(d.getTime())?null:d;
+}
+function timeOf(f,type){
+  const d=parseFlightTime(rawTime(f,type));
+  return d?d.toLocaleTimeString("de-CH",{hour:"2-digit",minute:"2-digit"}):"";
+}
+function dateOf(f,type){
+  const d=parseFlightTime(rawTime(f,type));
+  return d?d.toDateString():"";
+}
+function airportCity(f){
+  return clean(f.cityEn||f.city||f.airportName||"");
+}
+function flightName(f){
+  return clean((f.FLC||"")+" "+(f.FLN||f.flightNumber||""));
+}
+function aircraft(f){
+  return clean(f.model || ((f.manufacturerName||"")+" "+(f.TYP||"")).trim() || f.ICT || "");
+}
+function airline(f){return clean(f.airline||f.FLC||"")}
+function status(f){
+  return clean(f.statusTextEn||f.status||"");
+}
+
+function normalize(data){
+  // Current endpoint is documented as a JSON array; tolerate {data:[...]} too.
+  if(Array.isArray(data))return data;
+  if(Array.isArray(data?.data))return data.data;
+  if(Array.isArray(data?.flights))return data.flights;
+  return [];
+}
+
+async function fetchFids(){
+  try{
+    const r=await fetch(FIDS,{cache:"no-store"});
+    if(!r.ok)throw Error("direct "+r.status);
+    return normalize(await r.json());
+  }catch(e){
+    // Local file:// pages may be blocked by CORS. Try the text bridge as fallback.
+    const r=await fetch(FALLBACK,{cache:"no-store"});
+    if(!r.ok)throw Error("flight data unavailable ("+r.status+")");
+    const text=await r.text();
+    try{return normalize(JSON.parse(text))}
+    catch{
+      // Jina may wrap the JSON in a text response. Extract an array or object.
+      const a=text.indexOf("[");
+      const b=text.lastIndexOf("]");
+      if(a>=0&&b>a){
+        try{return normalize(JSON.parse(text.slice(a,b+1)))}catch{}
+      }
+      const oa=text.indexOf("{");
+      const ob=text.lastIndexOf("}");
+      if(oa>=0&&ob>oa){
+        try{return normalize(JSON.parse(text.slice(oa,ob+1)))}catch{}
+      }
+      throw Error("flight data was not returned as JSON");
+    }
+  }
+}
+
+function splitFlights(all){
+  const a=[],d=[];
+  for(const f of all){
+    const t=String(f.flightType||"").toLowerCase();
+    if(t.includes("a"))a.push(f);
+    else if(t.includes("d"))d.push(f);
+  }
+  a.sort((x,y)=>(parseFlightTime(rawTime(x,"arrival"))?.getTime()||0)-(parseFlightTime(rawTime(y,"arrival"))?.getTime()||0));
+  d.sort((x,y)=>(parseFlightTime(rawTime(x,"departure"))?.getTime()||0)-(parseFlightTime(rawTime(y,"departure"))?.getTime()||0));
+  return [a,d];
+}
+
+function render(list,type,target){
+  if(!list.length){
+    $(target).innerHTML='<div class="empty">No flight data available.</div>';
+    return;
+  }
+  $(target).innerHTML=list.map(f=>{
+    const time=timeOf(f,type);
+    const city=airportCity(f);
+    const route=type==="departure"
+      ? (city?`→ ${esc(city)}`:"→ —")
+      : (city?`← ${esc(city)}`:"← —");
+    const meta=[airline(f),aircraft(f)].filter(Boolean).map(esc).join(" · ");
+    return `<div class="row">
+      <div class="time">${esc(time||"--:--")}</div>
+      <div class="flight">${esc(flightName(f)||"—")}</div>
+      <div class="route">${route}<div class="meta">${meta}</div></div>
+      <div class="status">${esc(status(f))}</div>
+    </div>`;
+  }).join("");
+}
+
+function currentMinute(d){
+  return {h:d.getHours(),m:d.getMinutes(),date:d.toDateString()};
+}
+
+function checkAlerts(){
+  if(!started)return;
+  const now=new Date(),c=currentMinute(now);
+  const due=[];
+
+  for(const [list,type] of [[arrivals,"arrival"],[departures,"departure"]]){
+    for(const f of list){
+      const raw=rawTime(f,type);
+      if(!raw)continue;
+      const d=parseFlightTime(raw);
+      if(!d)continue;
+      if(d.toDateString()!==c.date||d.getHours()!==c.h||d.getMinutes()!==c.m)continue;
+
+      const key=type+"|"+flightName(f)+"|"+raw;
+      if(seen.has(key))continue;
+      seen.add(key);
+
+      const flight=flightName(f)||"unknown flight";
+      const city=airportCity(f);
+      const company=airline(f);
+      const ac=aircraft(f);
+
+      const message=type==="departure"
+        ? `Departure. Flight ${flight}${city?" to "+city:""}.`
+        : `Arrival. Flight ${flight}${city?" from "+city:""}.`;
+
+      const detail=[
+        company?`Airline: ${company}`:"",
+        ac?`Aircraft: ${ac}`:"",
+        `Scheduled/estimated: ${timeOf(f,type)}`
+      ].filter(Boolean).join(" · ");
+
+      due.push({message,detail});
+    }
+  }
+
+  if(due.length){
+    popup(due);
+    $("status").textContent=`🔔 ${due.length} flight${due.length>1?"s":""} at ${now.toLocaleTimeString()}`;
+  }
+}
+
+async function update(){
+  try{
+    const all=await fetchFids();
+    [arrivals,departures]=splitFlights(all);
+    render(arrivals,"arrival","arrivals");
+    render(departures,"departure","departures");
+    $("status").textContent=`● Live FIDS data · ${new Date().toLocaleTimeString()}`;
+    checkAlerts();
+  }catch(e){
+    $("status").textContent="⚠ "+e.message;
+  }
+}
+
+$("start").addEventListener("click",async()=>{
+  started=true;
+  $("start").disabled=true;$("stop").disabled=false;
+  await update();
+  timer=setInterval(update,15000);
+});
+$("stop").addEventListener("click",()=>{
+  started=false;
+  clearInterval(timer);timer=null;
+  $("start").disabled=false;$("stop").disabled=true;
+  $("status").textContent="Clock running · alerts stopped";
+});
+$("test").addEventListener("click",()=>{
+  popup([{message:"Test alert. Zürich Airport flight monitor is working.",detail:"This is only a voice and popup test."}]);
+});
+
+update();
+</script>
+</body>
+</html>
